@@ -776,9 +776,19 @@ func (r *Repository) UpdateUserConfig(profileID, audiobookshelfURL, audiobookshe
 	return nil
 }
 
-// DeleteProfile soft deletes a sync profile by setting active to false
+// DeleteProfile soft deletes a sync profile by setting active to false.
+// Booksync F2: it also releases the profile's Audiobookshelf link, so a
+// deleted profile never keeps holding an Audiobookshelf user under the unique
+// index and the member can link again from a new profile.
 func (r *Repository) DeleteProfile(profileID string) error {
-	result := r.db.GetDB().Model(&SyncProfile{}).Where("id = ?", profileID).Update("active", false)
+	result := r.db.GetDB().Model(&SyncProfile{}).Where("id = ?", profileID).Updates(map[string]interface{}{
+		"active":             false,
+		"abs_user_id":        nil,
+		"abs_username":       "",
+		"abs_link_state":     ABSLinkStateNone,
+		"hardcover_state":    HardcoverStateNone,
+		"hardcover_username": "",
+	})
 	if result.Error != nil {
 		return fmt.Errorf("failed to delete sync profile: %w", result.Error)
 	}

@@ -232,6 +232,12 @@ func main() {
 	}
 	// Create multi-user service
 	multiUserService := multiuser.NewMultiUserService(repo, cfg, log)
+	// Booksync F4: without the server-held Audiobookshelf admin key nothing can
+	// sync. Keep running (sign-in, linking and Hardcover connect still work)
+	// and say so once here; every sync start is refused.
+	if !multiUserService.PerProfileABS() && !multiUserService.ABSAdminConfigured() {
+		log.Error("Audiobookshelf admin key not configured: every sync will be refused until AUDIOBOOKSHELF_TOKEN is set", nil)
+	}
 	if err := multiUserService.ReconcileInterruptedSyncRuns(); err != nil {
 		log.Error("Failed to reconcile interrupted sync runs", map[string]interface{}{
 			"error": err.Error(),
@@ -375,6 +381,14 @@ func main() {
 							"profile_id": profileID,
 						})
 						if _, err := multiUserService.StartSyncWithAcceptedRun(profileID); err != nil {
+							// Booksync F2: a profile waiting for link approval is expected,
+							// not an error.
+							if errors.Is(err, multiuser.ErrProfileNotApproved) || errors.Is(err, multiuser.ErrHardcoverNotConnected) || errors.Is(err, multiuser.ErrABSNotConfigured) {
+								log.Debug("Profile not ready (link not approved, Hardcover not connected, or ABS admin key missing), skipping initial sync", map[string]interface{}{
+									"profile_id": profileID,
+								})
+								return
+							}
 							log.Error("Failed to start sync for profile", map[string]interface{}{
 								"profile_id": profileID,
 								"error":      err.Error(),
@@ -402,6 +416,13 @@ func main() {
 							accepted, err := multiUserService.StartSyncWithAcceptedRun(profileID)
 							if errors.Is(err, multiuser.ErrSyncAlreadyActive) {
 								log.Debug("Sync already in progress for profile, skipping", map[string]interface{}{
+									"profile_id": profileID,
+								})
+								return
+							}
+							// Booksync F2: waiting for link approval is expected.
+							if errors.Is(err, multiuser.ErrProfileNotApproved) || errors.Is(err, multiuser.ErrHardcoverNotConnected) || errors.Is(err, multiuser.ErrABSNotConfigured) {
+								log.Debug("Profile not ready (link not approved, Hardcover not connected, or ABS admin key missing), skipping periodic sync", map[string]interface{}{
 									"profile_id": profileID,
 								})
 								return

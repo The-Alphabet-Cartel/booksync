@@ -45,6 +45,7 @@ func newRouteTestFixture(t *testing.T, authEnabled bool) *routeTestFixture {
 	repo := database.NewRepository(db, encryptor, logger.Get())
 	cfg := config.DefaultConfig()
 	cfg.Paths.DataDir = dataDir
+	cfg.TestPerProfileABS = true // Booksync F4: upstream per-profile ABS, test-only
 	multiUserService := multiuser.NewMultiUserService(repo, cfg, logger.Get())
 
 	authConfig := auth.DefaultAuthConfig()

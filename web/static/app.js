@@ -62,6 +62,9 @@ class SyncProfileApp {
         // replaced run. Each entry records the latest status request sequence
         // that was in flight when the start was accepted.
         this.trackedRunIds = new Map();
+        // Booksync F2: the admin view of member -> Audiobookshelf links.
+        this.absLinks = [];
+        this.absUserOptions = [];
 
         this.init();
     }
@@ -88,6 +91,11 @@ class SyncProfileApp {
     isViewer() {
         return Boolean(this.authEnabled && this.currentUser
             && String(this.currentUser.role || '').toLowerCase() === 'viewer');
+    }
+
+    isAdmin() {
+        return Boolean(this.authEnabled && this.currentUser
+            && String(this.currentUser.role || '').toLowerCase() === 'admin');
     }
 
     beginSessionMutation(key) {
@@ -138,6 +146,24 @@ class SyncProfileApp {
         }
         if (viewer && document.getElementById('edit-user-modal')?.style.display === 'block') {
             this.closeEditModal();
+        }
+
+        // Booksync F2: only admins see the Links tab. The server refuses
+        // everyone else regardless; this only keeps the UI honest.
+        const admin = this.isAdmin();
+        const linksTab = [...document.querySelectorAll('.tab-button')]
+            .find(button => button.getAttribute('onclick') === "showTab('links')");
+        const linksContent = document.getElementById('links-tab');
+        if (!admin && linksContent?.classList.contains('active')) {
+            this.showTab('users');
+        }
+        if (linksTab) {
+            linksTab.hidden = !admin;
+            linksTab.style.display = admin ? '' : 'none';
+        }
+        if (linksContent) {
+            linksContent.hidden = !admin;
+            linksContent.style.display = admin ? '' : 'none';
         }
 
         // Re-render already-loaded cards when the session role changes so a
@@ -194,6 +220,7 @@ class SyncProfileApp {
             }
             
             // If we get here, either auth is disabled or user is authenticated
+            this.showHardcoverResultFromURL();
             try {
                 // Status loading owns the initial loading state and loads profiles
                 // before fetching their statuses.
@@ -428,11 +455,14 @@ class SyncProfileApp {
                 if (!card || !container.contains(card)) return;
                 const profileId = card.dataset.profileId;
 
-                if (this.isViewer() && ['edit', 'delete', 'start', 'cancel'].includes(button.dataset.profileAction)) {
+                if (this.isViewer() && ['edit', 'delete', 'start', 'cancel', 'link', 'hc-connect', 'hc-disconnect'].includes(button.dataset.profileAction)) {
                     return;
                 }
 
                 switch (button.dataset.profileAction) {
+                    case 'link': this.linkProfile(profileId); break;
+                    case 'hc-connect': this.connectHardcover(profileId); break;
+                    case 'hc-disconnect': this.disconnectHardcover(profileId); break;
                     case 'edit': this.editProfile(profileId); break;
                     case 'delete': this.deleteProfile(profileId); break;
                     case 'start': this.startSync(profileId); break;
@@ -447,6 +477,23 @@ class SyncProfileApp {
         };
         bindProfileActions('users-list', '.user-card[data-profile-id]');
         bindProfileActions('sync-status', '.status-card[data-profile-id]');
+
+        document.getElementById('abs-links-list')?.addEventListener('click', (event) => {
+            const button = event.target.closest('button[data-link-action]');
+            if (!button) return;
+            const row = button.closest('[data-profile-id]');
+            if (!row) return;
+            const profileId = row.dataset.profileId;
+            switch (button.dataset.linkAction) {
+                case 'approve': this.adminLinkAction(profileId, 'approve'); break;
+                case 'reject': this.adminLinkAction(profileId, 'reject'); break;
+                case 'set': {
+                    const select = row.querySelector('select[data-link-select]');
+                    if (select?.value) this.adminSetLink(profileId, select.value);
+                    break;
+                }
+            }
+        });
 
         document.getElementById('sync-summary-content').addEventListener('click', (event) => {
             if (!event.target.closest('[data-details-retry]')) return;
@@ -486,6 +533,9 @@ class SyncProfileApp {
         if (this.isViewer() && tabName === 'add-user') {
             tabName = 'users';
         }
+        if (!this.isAdmin() && tabName === 'links') {
+            tabName = 'users';
+        }
         // Update tab buttons
         document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
         document.querySelector(`[onclick="showTab('${tabName}')"]`).classList.add('active');
@@ -499,6 +549,8 @@ class SyncProfileApp {
             this.loadProfiles();
         } else if (tabName === 'sync') {
             this.loadStatuses();
+        } else if (tabName === 'links') {
+            this.loadABSLinks();
         }
     }
 
@@ -544,6 +596,8 @@ class SyncProfileApp {
                                 <strong>Last Synced:</strong>
                                 <span class="last-sync" title="${lastSyncISO ? new Date(lastSyncISO).toLocaleString() : 'Never'}">${lastSync}</span>
                             </div>
+                            ${this.authEnabled ? this.renderABSLinkItem(user.abs_link) : ''}
+                            ${this.authEnabled ? this.renderHardcoverItem(user.hardcover) : ''}
                         </div>
                         
                         ${this.isViewer() ? '' : `<div class="user-card-actions">
@@ -553,7 +607,11 @@ class SyncProfileApp {
                             <button class="btn btn-sm btn-icon btn-danger" data-profile-action="delete" title="Delete Profile">
                                 <span class="icon">🗑️</span> Delete
                             </button>
-                            <button class="btn btn-sm btn-primary" data-profile-action="start" ${user.active ? '' : 'disabled'}>
+                            ${this.authEnabled && this.canRelink(user.abs_link) ? `<button class="btn btn-sm btn-secondary" data-profile-action="link" title="Find my Audiobookshelf account">
+                                <span class="icon">🔗</span> Link Audiobookshelf
+                            </button>` : ''}
+                            ${this.authEnabled ? this.renderHardcoverButton(user.hardcover) : ''}
+                            <button class="btn btn-sm btn-primary" data-profile-action="start" ${user.active && this.canSync(user.abs_link, user.hardcover) ? '' : 'disabled'}>
                                 <span class="icon">🔄</span> Sync Now
                             </button>
                         </div>`}
@@ -561,6 +619,279 @@ class SyncProfileApp {
                 </div>
             `;
         }).join('');
+    }
+
+    // Booksync F2: an owned profile syncs only once an admin has approved its
+    // Audiobookshelf link. With authentication off there is no gate.
+    absLinkState(link) {
+        const state = String(link?.state || 'none').toLowerCase();
+        return ['none', 'pending', 'approved', 'rejected'].includes(state) ? state : 'none';
+    }
+
+    canSync(link, hardcover) {
+        if (!this.authEnabled) return true;
+        return this.absLinkState(link) === 'approved' && this.hardcoverState(hardcover) === 'connected';
+    }
+
+    // Booksync F3: the member's Hardcover OAuth connection.
+    hardcoverState(hardcover) {
+        const state = String(hardcover?.state || 'none').toLowerCase();
+        return ['none', 'connected', 'needs_reconnect'].includes(state) ? state : 'none';
+    }
+
+    describeHardcover(hardcover) {
+        const name = String(hardcover?.username || '');
+        switch (this.hardcoverState(hardcover)) {
+            case 'connected': return { label: name ? `Connected as ${name}` : 'Connected', tone: 'active' };
+            case 'needs_reconnect': return { label: 'Hardcover stopped accepting booksync. Reconnect to resume.', tone: 'pending' };
+            default: return { label: 'Not connected', tone: 'inactive' };
+        }
+    }
+
+    renderHardcoverItem(hardcover) {
+        const { label, tone } = this.describeHardcover(hardcover);
+        return `<div class="user-info-item">
+                                <strong>Hardcover:</strong>
+                                <span class="abs-link-state ${tone}">${this.escapeHtml(label)}</span>
+                            </div>`;
+    }
+
+    renderHardcoverButton(hardcover) {
+        switch (this.hardcoverState(hardcover)) {
+            case 'connected':
+                return `<button class="btn btn-sm btn-secondary" data-profile-action="hc-disconnect" title="Stop booksync writing to your Hardcover">
+                                <span class="icon">🔌</span> Disconnect Hardcover
+                            </button>`;
+            case 'needs_reconnect':
+                return `<button class="btn btn-sm btn-primary" data-profile-action="hc-connect" title="Approve booksync on Hardcover again">
+                                <span class="icon">📚</span> Reconnect Hardcover
+                            </button>`;
+            default:
+                return `<button class="btn btn-sm btn-primary" data-profile-action="hc-connect" title="Approve booksync on Hardcover">
+                                <span class="icon">📚</span> Connect Hardcover
+                            </button>`;
+        }
+    }
+
+    connectHardcover(profileId) {
+        if (this.isViewer()) return;
+        // A full-page navigation: the server redirects to Hardcover's consent page.
+        window.location.href = this.profileUrl(profileId, '/hardcover/connect');
+    }
+
+    async disconnectHardcover(profileId) {
+        if (this.isViewer()) return;
+        if (!confirm('Disconnect Hardcover? booksync will stop updating your Hardcover until you connect again.')) return;
+        try {
+            this.showLoading();
+            const response = await fetch(this.profileUrl(profileId, '/hardcover/disconnect'), {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.success) throw new Error(result.error || `request failed (${response.status})`);
+            if (result.data?.revoked === false) {
+                this.showToast('Disconnected here, but Hardcover did not confirm. Remove booksync from Authorized Apps in your Hardcover settings.', 'error');
+            } else {
+                this.showToast('Hardcover disconnected', 'success');
+            }
+        } catch (error) {
+            this.showToast('Could not disconnect Hardcover: ' + error.message, 'error');
+        } finally {
+            this.hideLoading();
+            this.loadProfiles();
+        }
+    }
+
+    // The server sends the browser back with ?hardcover=<outcome>; only fixed
+    // codes, never error text, so a link cannot inject a message.
+    hardcoverResultMessage(result) {
+        const messages = {
+            'connected': ['Hardcover connected', 'success'],
+            'error:denied': ['Hardcover connection was not approved', 'error'],
+            'error:expired': ['That took too long. Click Connect Hardcover again.', 'error'],
+            'error:state': ['That Hardcover connection could not be matched to your session. Click Connect Hardcover again.', 'error'],
+            'error:issuer': ['The reply did not come from Hardcover. Nothing was saved.', 'error'],
+            'error:not_configured': ['Hardcover is not set up on this server yet. Ask PB.', 'error'],
+            'error:not_owner': ['Only the profile owner can connect Hardcover.', 'error'],
+            'error:not_found': ['That profile no longer exists.', 'error'],
+            'error:failed': ['Connecting Hardcover failed. Try again later.', 'error']
+        };
+        return messages[result] || null;
+    }
+
+    showHardcoverResultFromURL() {
+        try {
+            const params = new URLSearchParams(window.location.search);
+            const result = params.get('hardcover');
+            if (!result) return;
+            const message = this.hardcoverResultMessage(result);
+            if (message) this.showToast(message[0], message[1]);
+            params.delete('hardcover');
+            const query = params.toString();
+            window.history.replaceState(null, '', window.location.pathname + (query ? `?${query}` : ''));
+        } catch (_) {
+            // Not fatal: the profile card shows the real state.
+        }
+    }
+
+    canRelink(link) {
+        return ['none', 'rejected'].includes(this.absLinkState(link));
+    }
+
+    describeABSLink(link) {
+        const state = this.absLinkState(link);
+        const name = String(link?.abs_username || '');
+        switch (state) {
+            case 'approved': return { label: name ? `Linked to ${name}` : 'Linked', tone: 'active' };
+            case 'pending': return { label: name ? `Matched ${name}, waiting for approval` : 'Waiting for approval', tone: 'pending' };
+            case 'rejected': return { label: 'Link rejected. Ask PB.', tone: 'inactive' };
+            default: return { label: 'Not linked yet', tone: 'inactive' };
+        }
+    }
+
+    renderABSLinkItem(link) {
+        const { label, tone } = this.describeABSLink(link);
+        return `<div class="user-info-item">
+                                <strong>Audiobookshelf:</strong>
+                                <span class="abs-link-state ${tone}">${this.escapeHtml(label)}</span>
+                            </div>`;
+    }
+
+    async linkProfile(profileId) {
+        if (this.isViewer()) return;
+        const mutationKey = `link-profile:${String(profileId)}`;
+        const mutation = this.beginSessionMutation(mutationKey);
+        try {
+            this.showLoading();
+            const response = await fetch(this.profileUrl(profileId, '/abs-link'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                ...(mutation.controller ? { signal: mutation.controller.signal } : {})
+            });
+            if (!this.isCurrentSessionMutation(mutationKey, mutation)) return;
+            const result = await response.json().catch(() => ({}));
+            if (!this.isCurrentSessionMutation(mutationKey, mutation)) return;
+            if (response.ok && result.success) {
+                this.showToast(this.describeABSLink(result.data).label, 'success');
+            } else {
+                this.showToast(result.error || 'Could not link your Audiobookshelf account', 'error');
+            }
+            this.loadProfiles();
+        } catch (error) {
+            if (!this.isCurrentSessionMutation(mutationKey, mutation) || error.name === 'AbortError') return;
+            this.showToast('Error linking Audiobookshelf: ' + error.message, 'error');
+        } finally {
+            if (this.finishSessionMutation(mutationKey, mutation) && this.sessionMutationRequests.size === 0) {
+                this.hideLoading();
+            }
+        }
+    }
+
+    async loadABSLinks() {
+        if (!this.isAdmin()) return;
+        const authGeneration = this.authSessionGeneration;
+        try {
+            this.showLoading();
+            const [links, users] = await Promise.all([
+                this.fetchJsonWithTimeout('/api/admin/abs-links', { credentials: 'include' }),
+                this.fetchJsonWithTimeout('/api/admin/abs-users', { credentials: 'include' })
+            ]);
+            if (authGeneration !== this.authSessionGeneration) return;
+            if (links.response.status === 401 || users.response.status === 401) {
+                this.handleAuthExpiry();
+                return;
+            }
+            if (!links.response.ok || !links.data.success) {
+                throw new Error(links.data.error || `links request failed (${links.response.status})`);
+            }
+            this.absLinks = Array.isArray(links.data.data) ? links.data.data : [];
+            // The user list needs Audiobookshelf; the links still render
+            // without it, only the manual re-link is unavailable.
+            this.absUserOptions = users.response.ok && users.data.success && Array.isArray(users.data.data)
+                ? users.data.data
+                : [];
+            if (!users.response.ok) {
+                this.showToast('Audiobookshelf users unavailable: ' + (users.data.error || users.response.status), 'error');
+            }
+            this.renderABSLinks();
+        } catch (error) {
+            if (authGeneration !== this.authSessionGeneration || error.name === 'AbortError') return;
+            this.showToast('Error loading Audiobookshelf links: ' + error.message, 'error');
+        } finally {
+            if (authGeneration === this.authSessionGeneration) this.hideLoading();
+        }
+    }
+
+    renderABSLinks() {
+        const container = document.getElementById('abs-links-list');
+        if (!container) return;
+        if (!this.absLinks.length) {
+            container.innerHTML = '<div class="empty-state"><p>No profiles yet.</p></div>';
+            return;
+        }
+        const options = this.absUserOptions.map(option => `<option value="${this.escapeHtmlAttribute(option.id)}">${this.escapeHtml(option.username)}${option.has_openid_link ? '' : ' (no Pocket ID link)'}</option>`).join('');
+        container.innerHTML = `<table class="abs-links-table">
+            <thead><tr><th>Profile</th><th>Owner</th><th>Audiobookshelf user</th><th>State</th><th>Actions</th></tr></thead>
+            <tbody>${this.absLinks.map(row => {
+                const state = this.absLinkState({ state: row.abs_link_state });
+                const { tone } = this.describeABSLink({ state });
+                return `<tr data-profile-id="${this.escapeHtmlAttribute(row.profile_id)}">
+                    <td>${this.escapeHtml(row.profile_name || row.profile_id)}</td>
+                    <td>${this.escapeHtml(row.owner_username || '(no owner)')}</td>
+                    <td>${this.escapeHtml(row.abs_username || '-')}</td>
+                    <td><span class="abs-link-state ${tone}">${this.escapeHtml(state)}</span></td>
+                    <td class="abs-link-actions">
+                        ${state === 'pending' ? '<button class="btn btn-sm btn-primary" data-link-action="approve">Approve</button>' : ''}
+                        ${state === 'pending' || state === 'approved' ? '<button class="btn btn-sm btn-danger" data-link-action="reject">Reject</button>' : ''}
+                        ${options ? `<select data-link-select aria-label="Audiobookshelf user"><option value="">Link to...</option>${options}</select>
+                        <button class="btn btn-sm btn-secondary" data-link-action="set">Link</button>` : ''}
+                    </td>
+                </tr>`;
+            }).join('')}</tbody>
+        </table>`;
+    }
+
+    async adminLinkRequest(profileId, method, suffix, body) {
+        const response = await fetch(`/api/admin/profiles/${encodeURIComponent(String(profileId))}/abs-link${suffix}`, {
+            method,
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            ...(body ? { body: JSON.stringify(body) } : {})
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) throw new Error(result.error || `request failed (${response.status})`);
+        return result.data;
+    }
+
+    async adminLinkAction(profileId, action) {
+        if (!this.isAdmin()) return;
+        if (action === 'reject' && !confirm('Reject this link? The member will have to link again.')) return;
+        try {
+            this.showLoading();
+            await this.adminLinkRequest(profileId, 'POST', `/${action}`);
+            this.showToast(action === 'approve' ? 'Link approved' : 'Link rejected', 'success');
+        } catch (error) {
+            this.showToast(`Could not ${action} the link: ${error.message}`, 'error');
+        } finally {
+            this.hideLoading();
+            this.loadABSLinks();
+        }
+    }
+
+    async adminSetLink(profileId, absUserId) {
+        if (!this.isAdmin()) return;
+        try {
+            this.showLoading();
+            const link = await this.adminLinkRequest(profileId, 'PUT', '', { abs_user_id: absUserId });
+            this.showToast(this.describeABSLink(link).label, 'success');
+        } catch (error) {
+            this.showToast('Could not link this profile: ' + error.message, 'error');
+        } finally {
+            this.hideLoading();
+            this.loadABSLinks();
+        }
     }
 
     async fetchJsonWithTimeout(url, options = {}) {
@@ -996,6 +1327,9 @@ class SyncProfileApp {
         this.terminalErrorRetries.clear();
         this.terminalErrorRequests.clear();
         this.trackedRunIds.clear();
+        this.absLinks = [];
+        this.absUserOptions = [];
+        this.renderABSLinks();
         this.resetProfileRetry();
         this.authSessionGeneration += 1;
         this.statusLoadSequence += 1;
@@ -1784,9 +2118,6 @@ class SyncProfileApp {
         const profileData = {
             id: profileId,
             name: formData.get('name'),
-            audiobookshelf_url: formData.get('audiobookshelf_url'),
-            audiobookshelf_token: formData.get('audiobookshelf_token'),
-            hardcover_token: formData.get('hardcover_token'),
                 sync_config: {
                     incremental: formData.get('incremental') === 'on',
                     min_change_threshold: 60,
@@ -1826,6 +2157,12 @@ class SyncProfileApp {
 
             if (data.success) {
                 this.showToast('Profile created successfully!', 'success');
+                // Booksync F2: say what the Audiobookshelf match did.
+                if (data.data?.abs_link_error) {
+                    this.showToast(data.data.abs_link_error, 'error');
+                } else if (this.authEnabled && data.data?.abs_link) {
+                    this.showToast(this.describeABSLink(data.data.abs_link).label, 'info');
+                }
                 event.target.reset();
                 this.loadProfiles();
                 this.showTab('users');
@@ -1917,7 +2254,6 @@ class SyncProfileApp {
         // Basic user fields - use correct data structure from ProfileWithTokens
         document.getElementById('edit-user-id').value = user.profile.id;
         document.getElementById('edit-user-name').value = user.profile.name;
-        document.getElementById('edit-abs-url').value = user.audiobookshelf_url;
         
         // Sync configuration fields
         document.getElementById('edit-incremental').checked = this.toBool(config.incremental, false);
@@ -1965,9 +2301,6 @@ class SyncProfileApp {
 
         // Update user config with form data
         const configUpdateData = {
-            audiobookshelf_url: formData.get('audiobookshelf_url'),
-            audiobookshelf_token: formData.get('audiobookshelf_token'),
-            hardcover_token: formData.get('hardcover_token'),
                 sync_config: {
                     incremental: formData.get('incremental') === 'on',
                     min_change_threshold: 60,

@@ -60,6 +60,9 @@ func New(addr string, multiUserService *multiuser.MultiUserService, authService 
 	handler.HandleFunc("GET /auth/callback/{provider}", s.authHandlers.HandleOAuthCallback)
 	handler.HandleFunc("GET /auth/oauth/{provider}", s.authHandlers.HandleOAuthLogin)
 	handler.HandleFunc("POST /api/auth/logout", s.authHandlers.HandleLogout)
+	// Booksync F3: Hardcover sends the member's browser back here. It needs the
+	// member's session, so it sits behind RequireAuth.
+	handler.Handle("GET /auth/hardcover/callback", s.authMiddleware.RequireAuth(http.HandlerFunc(s.apiHandler.HardcoverCallback)))
 
 	// Public API endpoints (no auth required)
 	handler.HandleFunc("GET /api/status", s.handleAPIStatus) // General status check
@@ -75,6 +78,20 @@ func New(addr string, multiUserService *multiuser.MultiUserService, authService 
 	apiMux.HandleFunc("POST /api/profiles/{id}/sync", s.apiHandler.StartSync)
 	apiMux.HandleFunc("DELETE /api/profiles/{id}/sync", s.apiHandler.CancelSync)
 	apiMux.HandleFunc("GET /api/profiles/{id}/runs/{runID}/details", s.apiHandler.GetRunDetails)
+
+	// Booksync F2: member -> Audiobookshelf user link, and the admin view
+	// that approves it. Admin handlers answer 404 to everyone else.
+	apiMux.HandleFunc("POST /api/profiles/{id}/abs-link", s.apiHandler.LinkProfileABS)
+	apiMux.HandleFunc("GET /api/admin/abs-links", s.apiHandler.ListABSLinks)
+	apiMux.HandleFunc("GET /api/admin/abs-users", s.apiHandler.ListABSUsers)
+	apiMux.HandleFunc("POST /api/admin/profiles/{id}/abs-link/approve", s.apiHandler.ApproveABSLink)
+	apiMux.HandleFunc("POST /api/admin/profiles/{id}/abs-link/reject", s.apiHandler.RejectABSLink)
+	apiMux.HandleFunc("PUT /api/admin/profiles/{id}/abs-link", s.apiHandler.SetABSLink)
+
+	// Booksync F3: Hardcover OAuth connect / disconnect. Connect is a browser
+	// navigation that ends in a redirect to Hardcover.
+	apiMux.HandleFunc("GET /api/profiles/{id}/hardcover/connect", s.apiHandler.ConnectHardcover)
+	apiMux.HandleFunc("POST /api/profiles/{id}/hardcover/disconnect", s.apiHandler.DisconnectHardcover)
 
 	// Mount profile API routes under /api with auth middleware. Keep the /api
 	// prefix in the mux patterns: StripPrefix would operate on URL.Path after

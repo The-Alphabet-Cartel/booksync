@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Audiobookshelf-Hardcover Sync - Sync Profile Management</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="stylesheet" href="styles.css?v=20260915">
+    <link rel="stylesheet" href="styles.css?v=20261005">
 </head>
 <body>
     <div class="container">
@@ -25,6 +25,7 @@
             <button class="tab-button active" onclick="showTab('users')">Profiles</button>
             <button class="tab-button" onclick="showTab('sync')">Sync Status</button>
             <button class="tab-button" onclick="showTab('add-user')">Add Profile</button>
+            <button class="tab-button" onclick="showTab('links')" hidden style="display: none;">Links</button>
         </nav>
 
         <!-- Users Tab -->
@@ -64,6 +65,18 @@
             </div>
         </div>
 
+        <!-- Booksync F2: admin view of member -> Audiobookshelf links -->
+        <div id="links-tab" class="tab-content" hidden style="display: none;">
+            <div class="section-header">
+                <h2>Audiobookshelf Links</h2>
+                <button class="btn btn-primary" onclick="app.loadABSLinks()">🔄 Refresh</button>
+            </div>
+            <p>A member's profile does not sync until its Audiobookshelf link is approved here.</p>
+            <div id="abs-links-list">
+                <!-- Links will be loaded here -->
+            </div>
+        </div>
+
         <!-- Add User Tab -->
         <div id="add-user-tab" class="tab-content">
             <div class="section-header">
@@ -82,22 +95,7 @@
                     <input type="text" id="user-name" name="name" required placeholder="John Doe">
                 </div>
 
-                <div class="form-group">
-                    <label for="abs-url">Audiobookshelf URL:</label>
-                    <input type="url" id="abs-url" name="audiobookshelf_url" required placeholder="https://your-audiobookshelf.com">
-                </div>
 
-                <div class="form-group">
-                    <label for="abs-token">Audiobookshelf Token:</label>
-                    <input type="password" id="abs-token" name="audiobookshelf_token" required placeholder="Your ABS API token">
-                    <button type="button" class="btn-toggle-password" onclick="togglePassword('abs-token')">👁️</button>
-                </div>
-
-                <div class="form-group">
-                    <label for="hc-token">Hardcover Token:</label>
-                    <input type="password" id="hc-token" name="hardcover_token" required placeholder="Your Hardcover API token">
-                    <button type="button" class="btn-toggle-password" onclick="togglePassword('hc-token')">👁️</button>
-                </div>
 
                 <div class="form-section">
                     <h3>Sync Configuration</h3>
@@ -207,22 +205,7 @@
                     <input type="text" id="edit-user-name" name="name" required>
                 </div>
 
-                <div class="form-group">
-                    <label for="edit-abs-url">Audiobookshelf URL:</label>
-                    <input type="url" id="edit-abs-url" name="audiobookshelf_url" required>
-                </div>
 
-                <div class="form-group">
-                    <label for="edit-abs-token">Audiobookshelf Token:</label>
-                    <input type="password" id="edit-abs-token" name="audiobookshelf_token" placeholder="Leave empty to keep current token">
-                    <button type="button" class="btn-toggle-password" onclick="togglePassword('edit-abs-token')">👁️</button>
-                </div>
-
-                <div class="form-group">
-                    <label for="edit-hc-token">Hardcover Token:</label>
-                    <input type="password" id="edit-hc-token" name="hardcover_token" placeholder="Leave empty to keep current token">
-                    <button type="button" class="btn-toggle-password" onclick="togglePassword('edit-hc-token')">👁️</button>
-                </div>
 
                 <div class="form-section">
                     <h3>Sync Configuration</h3>
@@ -326,6 +309,6 @@
     <!-- Toast Notifications -->
     <div id="toast-container" class="toast-container"></div>
 
-    <script src="app.js?v=20260915"></script>
+    <script src="app.js?v=20261005"></script>
 </body>
 </html>

@@ -158,11 +158,21 @@ type headerAddingTransport struct {
 	token   string
 	baseURL string
 	rt      http.RoundTripper
+	// tokenFunc, when set, supplies a fresh token per request (Booksync F3).
+	tokenFunc func() (string, error)
 }
 
 // RoundTrip implements the http.RoundTripper interface.
 func (t *headerAddingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "Bearer "+t.token)
+	token := t.token
+	if t.tokenFunc != nil {
+		fresh, err := t.tokenFunc()
+		if err != nil {
+			return nil, err
+		}
+		token = fresh
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	return t.rt.RoundTrip(req)
 }
@@ -182,6 +192,7 @@ const (
 type Client struct {
 	baseURL               string
 	authToken             string
+	tokenFunc             func() (string, error) // Booksync F3: OAuth token source; overrides authToken
 	dryRun                bool
 	httpClient            *http.Client
 	gqlClient             *graphql.Client
@@ -234,12 +245,25 @@ func (c *Client) logSkippedMutation(operation string) {
 // GetAuthHeader returns the properly formatted Authorization header value
 // This is a public method that can be used by other packages to get the auth header
 func (c *Client) GetAuthHeader() string {
+	header, _ := c.authHeader()
+	return header
+}
+
+// authHeader is GetAuthHeader with the token source's error (Booksync F3).
+func (c *Client) authHeader() (string, error) {
+	if c.tokenFunc != nil {
+		token, err := c.tokenFunc()
+		if err != nil {
+			return "", err
+		}
+		return "Bearer " + strings.TrimSpace(token), nil
+	}
 	// Ensure the token has the Bearer prefix
 	authToken := strings.TrimSpace(c.authToken)
 	if !strings.HasPrefix(authToken, "Bearer ") {
 		authToken = "Bearer " + authToken
 	}
-	return authToken
+	return authToken, nil
 }
 
 // safeString is a helper function to safely get a string value from a string pointer
@@ -265,6 +289,21 @@ func DefaultClientConfig() *ClientConfig {
 		RateLimit:     DefaultRateLimit,     // Use hardcoded default
 		MaxConcurrent: DefaultMaxConcurrent, // Use hardcoded default
 	}
+}
+
+// NewClientWithTokenSource creates a Hardcover client that asks tokenFunc for
+// the bearer token on every request (Booksync F3), so an OAuth access token
+// can be refreshed during a long sync.
+func NewClientWithTokenSource(cfg *ClientConfig, tokenFunc func() (string, error), log *logger.Logger) *Client {
+	if cfg == nil {
+		cfg = DefaultClientConfig()
+	}
+	c := NewClientWithConfig(cfg, "", log)
+	c.tokenFunc = tokenFunc
+	c.gqlClient = graphql.NewClient(cfg.BaseURL, &http.Client{
+		Transport: &headerAddingTransport{baseURL: cfg.BaseURL, rt: http.DefaultTransport, tokenFunc: tokenFunc},
+	})
+	return c
 }
 
 // NewClient creates a new Hardcover client with default configuration
@@ -496,11 +535,18 @@ func (c *Client) executeGraphQLOperation(ctx context.Context, op graphqlOperatio
 		rt:     transport,
 	}
 
-	// Set the authorization header
-	reqModifier := func(r *http.Request) {
-		r.Header.Set("Authorization", c.GetAuthHeader())
+	// Set the authorization header. Booksync F3: an OAuth token source may
+	// refresh here, or refuse when the member must reconnect; that error ends
+	// the operation instead of sending an empty token.
+	reqModifier := func(r *http.Request) error {
+		header, err := c.authHeader()
+		if err != nil {
+			return fmt.Errorf("hardcover authorization: %w", err)
+		}
+		r.Header.Set("Authorization", header)
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Accept", "application/json")
+		return nil
 	}
 
 	// Execute the operation using the GraphQL client with retry logic
@@ -533,7 +579,9 @@ func (c *Client) executeGraphQLOperation(ctx context.Context, op graphqlOperatio
 		}
 
 		// Apply the request modifier to add auth headers
-		reqModifier(req)
+		if err := reqModifier(req); err != nil {
+			return err
+		}
 
 		// Apply pacing and acquire a permit for the active HTTP request.
 		release, err := c.rateLimiter.Acquire(ctx)

@@ -491,7 +491,7 @@ func TestActiveSnapshotCheckpointSurvivesRestartReconcile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, database.SyncRunPhaseFailed, report.Phase)
 	require.Equal(t, "sync run interrupted by application restart", report.RunError)
-	restored, err := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get()).GetSyncRunSnapshot(profileID, run.runID)
+	restored, err := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get()).GetSyncRunSnapshot(profileID, run.runID)
 	require.NoError(t, err)
 	require.NotNil(t, restored)
 	require.Equal(t, int32(1), restored.ProcessedSoFar)
@@ -1021,7 +1021,7 @@ func TestRestartRestoresNewestTerminalReport(t *testing.T) {
 	secondStatus := acceptedTerminalStatus(profileID, second, string(syncsvc.RunPhaseCanceled))
 	require.True(t, service.publishFinalStatus(profileID, second.generation, secondStatus))
 
-	restarted := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get())
+	restarted := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get())
 	status := profileStatusForTest(t, restarted, profileID)
 	require.NotNil(t, status)
 	require.Equal(t, second.runID, status.Snapshot.RunID)
@@ -1100,7 +1100,7 @@ func requireFailedRunRestoration(t *testing.T, service *MultiUserService, profil
 	require.NotNil(t, status.Snapshot)
 	require.Equal(t, report.RunError, status.Snapshot.RunError)
 
-	restarted := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get())
+	restarted := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get())
 	restored, err := restarted.GetSyncRunSnapshot(profileID, runID)
 	require.NoError(t, err)
 	require.NotNil(t, restored)
@@ -1131,7 +1131,7 @@ func TestRestartRestoresNewestTerminalWhenQueuedReportFollowsTenTerminals(t *tes
 	require.NoError(t, err)
 	require.NotNil(t, oldest)
 
-	restarted := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get())
+	restarted := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get())
 	status := profileStatusForTest(t, restarted, profileID)
 	require.NotNil(t, status)
 	require.NotNil(t, status.Snapshot)
@@ -1157,7 +1157,7 @@ func TestRestartRestoresTerminalWhenQueuedReportsExceedLookupLimit(t *testing.T)
 			queuedAt.Add(time.Duration(generation+1)*time.Minute))
 	}
 
-	restarted := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get())
+	restarted := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get())
 	status := profileStatusForTest(t, restarted, profileID)
 	require.NotNil(t, status)
 	require.NotNil(t, status.Snapshot)
@@ -1178,7 +1178,7 @@ func TestAggregateStatusRestoresTerminalScalarsWithoutDetails(t *testing.T) {
 	report.SnapshotJSON = `{"books_total":12,"processed_so_far":7,"processed_count":7,"unattempted_count":5,"outcome_counts":{"synced":5},"total_books_processed":99,"books_synced":99,"books_not_found":[],"mismatches":[],"last_sync_summary":{"books_synced":99},"book_outcomes":[{"book_id":"book-1"}],"attention_records":[{"book_id":"book-1"}]}`
 	require.NoError(t, service.repository.UpsertSyncRunReportContext(context.Background(), report))
 
-	restarted := NewMultiUserService(service.repository, config.DefaultConfig(), logger.Get())
+	restarted := NewMultiUserService(service.repository, perProfileTestConfig(), logger.Get())
 	for poll := 0; poll < 2; poll++ {
 		statuses, err := restarted.GetAllProfileStatuses()
 		require.NoError(t, err)
@@ -1889,5 +1889,14 @@ func newStatusLookupService(t *testing.T) (*MultiUserService, *gorm.DB) {
 	encryptor, err := crypto.NewEncryptionManagerWithDataDir(dataDir, logger.Get())
 	require.NoError(t, err)
 	repo := database.NewRepository(db, encryptor, logger.Get())
-	return NewMultiUserService(repo, config.DefaultConfig(), logger.Get()), db.GetDB()
+	return NewMultiUserService(repo, perProfileTestConfig(), logger.Get()), db.GetDB()
+}
+
+// perProfileTestConfig is the default config with upstream's per-profile
+// Audiobookshelf settings turned on (Booksync F4), so upstream's tests keep
+// syncing against their own fake ABS servers.
+func perProfileTestConfig() *config.Config {
+	cfg := config.DefaultConfig()
+	cfg.TestPerProfileABS = true
+	return cfg
 }

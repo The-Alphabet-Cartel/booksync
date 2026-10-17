@@ -14,6 +14,7 @@ import (
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/config"
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/crypto"
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/database"
+	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/hardcoveroauth"
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/logger"
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/multiuser"
 	"github.com/stretchr/testify/require"
@@ -91,6 +92,7 @@ func newRouteTestFixtureWithHardcoverURL(t *testing.T, hardcoverURL string) *rou
 	cfg.Hardcover.BaseURL = hardcoverURL
 	cfg.RateLimit.Rate = time.Nanosecond
 	cfg.RateLimit.MaxConcurrent = 1
+	cfg.TestPerProfileABS = true // Booksync F4: upstream per-profile ABS, test-only
 	multiUserService := multiuser.NewMultiUserService(repo, cfg, logger.Get())
 
 	authConfig := auth.DefaultAuthConfig()
@@ -222,7 +224,9 @@ func TestAuthDisabledProfileResponsesRedactCredentialsAndPreserveUpdates(t *test
 			require.NotNil(t, profile)
 			require.Equal(t, test.url, profile.AudiobookshelfURL)
 			require.Equal(t, absToken, profile.AudiobookshelfToken)
-			require.Equal(t, hcToken, profile.HardcoverToken)
+			// Booksync F3: a pasted Hardcover token is never stored; Hardcover
+			// is connected through OAuth only.
+			require.Empty(t, profile.HardcoverToken)
 		})
 	}
 }
@@ -249,7 +253,9 @@ func TestProfileConfigUpdatePreservesOmittedAudiobookshelfURL(t *testing.T) {
 	require.NotNil(t, profile)
 	require.Equal(t, "http://saved.invalid", profile.AudiobookshelfURL)
 	require.Equal(t, "abs-token", profile.AudiobookshelfToken)
-	require.Equal(t, "rotated-token", profile.HardcoverToken)
+	// Booksync F3: neither create nor a config update stores a pasted
+	// Hardcover token.
+	require.Empty(t, profile.HardcoverToken)
 }
 
 func TestGetProfileIncludesPersistedLastSuccessfulAt(t *testing.T) {
@@ -406,6 +412,16 @@ func TestForeignProfileAuthorizationReturnsNotFoundForEveryRoute(t *testing.T) {
 	owner := newRouteSession(t, fixture, "route-owner", auth.RoleUser)
 	foreign := newRouteSession(t, fixture, "route-foreign", auth.RoleUser)
 	createRouteProfileAtURL(t, fixture, owner, "foreign-target", absServer.URL, "foreign-target-token")
+	// Booksync F2: an owned profile syncs only once its Audiobookshelf link is
+	// approved.
+	require.NoError(t, fixture.repo.SetABSLink("foreign-target", "abs-route-owner", "route-owner", database.ABSLinkStateApproved))
+	// Booksync F3: and only with a connected Hardcover account. A far-future
+	// expiry means the token source never needs to refresh.
+	fixture.server.multiUserService.SetHardcoverOAuthConfig(hardcoveroauth.Config{
+		ClientID: "route-client", ClientSecret: "route-secret", RedirectURL: "https://booksync.invalid/auth/hardcover/callback",
+	})
+	require.NoError(t, fixture.repo.SetHardcoverConnection("foreign-target",
+		`{"access_token":"hc_at_route","refresh_token":"hc_rt_route","expiry":"2999-01-01T00:00:00Z"}`, "route-owner"))
 
 	_, err := fixture.server.multiUserService.StartSyncWithAcceptedRun("foreign-target")
 	require.NoError(t, err)

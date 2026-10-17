@@ -1,14 +1,12 @@
 package audiobookshelf
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
+	"net/url"
 	"time"
 
 	"github.com/drallgood/audiobookshelf-hardcover-sync/internal/logger"
@@ -31,6 +29,10 @@ type Client struct {
 	token   string
 	client  *http.Client
 	logger  *logger.Logger
+	// userID, when set, makes GetUserProgress read that Audiobookshelf user
+	// through the admin key (GET /api/users/{id}) instead of the key's own
+	// user (/api/me). Booksync F4.
+	userID string
 }
 
 // NewClient creates a new Audiobookshelf client
@@ -48,6 +50,15 @@ func NewClient(baseURL, token string) *Client {
 		},
 		logger: log,
 	}
+}
+
+// NewClientForUser creates a client that reads one member's progress through
+// a server-held Audiobookshelf admin key (Booksync F4). Libraries and items
+// are still read as the key's own user; only GetUserProgress changes.
+func NewClientForUser(baseURL, adminToken, absUserID string) *Client {
+	c := NewClient(baseURL, adminToken)
+	c.userID = absUserID
+	return c
 }
 
 // GetLibraries fetches all libraries from Audiobookshelf
@@ -88,7 +99,6 @@ func (c *Client) GetLibraries(ctx context.Context) ([]AudiobookshelfLibrary, err
 	if resp.StatusCode != http.StatusOK {
 		log.Error("Unexpected status code", map[string]interface{}{
 			"status": resp.StatusCode,
-			"body":   string(body),
 		})
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -115,7 +125,7 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 	if libraryID == "" {
 		return nil, fmt.Errorf("library ID is required")
 	}
-	endpoint := fmt.Sprintf("/libraries/%s/items?include=progress&minified=0", libraryID)
+	endpoint := fmt.Sprintf("/libraries/%s/items?minified=0", libraryID)
 	log := c.logger.With(map[string]interface{}{
 		"endpoint": endpoint,
 	})
@@ -146,10 +156,10 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		// Booksync F4: never log a response body; an Audiobookshelf error
+		// page or user record can carry tokens.
 		log.Error("Unexpected status code", map[string]interface{}{
-			"status":   resp.StatusCode,
-			"response": string(body),
+			"status": resp.StatusCode,
 		})
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -163,112 +173,11 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Save the raw response to a file for inspection
-	logDir := "logs"
-
-	// Ensure the logs directory exists
-	log.Debug("Ensuring logs directory exists", map[string]interface{}{
-		"path": logDir,
-	})
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Error("Failed to create logs directory, falling back to current directory", map[string]interface{}{
-			"error": err.Error(),
-			"path":  logDir,
-		})
-		// Use current directory if logs directory fails
-		logDir = "."
-	}
-
-	logFile := filepath.Join(logDir, "audiobookshelf_response.json")
-
-	// Save the response to file
-	log.Debug("Saving API response to file", map[string]interface{}{
-		"path": logFile,
-	})
-	if err := os.WriteFile(logFile, body, 0644); err != nil {
-		log.Error("Failed to save API response to file", map[string]interface{}{
-			"error": err.Error(),
-			"path":  logFile,
-		})
-		// Try writing to /tmp as a last resort
-		tmpFile := filepath.Join(os.TempDir(), "audiobookshelf_response.json")
-		if writeErr := os.WriteFile(tmpFile, body, 0644); writeErr != nil {
-			log.Error("Failed to save API response to temp file", map[string]interface{}{
-				"error": writeErr.Error(),
-				"path":  tmpFile,
-			})
-		} else {
-			log.Debug("Saved raw API response to temp file", map[string]interface{}{
-				"path": tmpFile,
-			})
-		}
-	} else {
-		log.Debug("Successfully saved raw API response to file", map[string]interface{}{
-			"path": logFile,
-		})
-	}
-
-	// Keep the full response available for troubleshooting without exposing it
-	// during normal operation.
-	log.Debug("Raw API response from Audiobookshelf", map[string]interface{}{
-		"response": string(body),
-	})
-
-	// Save to a file in the current directory using absolute path
-	absPath := "/tmp/audiobookshelf_raw_response.json"
-	if err := os.WriteFile(absPath, body, 0644); err != nil {
-		log.Error("Failed to save raw response to file", map[string]interface{}{
-			"error": err.Error(),
-			"path":  absPath,
-		})
-	} else {
-		log.Debug("Saved raw response to file", map[string]interface{}{
-			"path": absPath,
-		})
-	}
-
-	// Also save to current working directory
-	cwd, _ := os.Getwd()
-	relPath := filepath.Join(cwd, "audiobookshelf_raw_response.json")
-	if err := os.WriteFile(relPath, body, 0644); err != nil {
-		log.Error("Failed to save raw response to current directory", map[string]interface{}{
-			"error": err.Error(),
-			"path":  relPath,
-		})
-	} else {
-		log.Debug("Saved raw response to current directory", map[string]interface{}{
-			"path": relPath,
-		})
-	}
-
-	// Try to read back the file to verify it was written correctly
-	if content, err := os.ReadFile(absPath); err != nil {
-		log.Error("Failed to read back saved response file", map[string]interface{}{
-			"error": err.Error(),
-			"path":  absPath,
-		})
-	} else if !bytes.Equal(content, body) {
-		log.Error("Saved file content does not match original response", map[string]interface{}{
-			"path": absPath,
-		})
-	}
-
-	// Log a sample of the response for debugging
-	sampleSize := 500
-	if len(body) < sampleSize {
-		sampleSize = len(body)
-	}
-	log.Debug("Raw API response sample from Audiobookshelf", map[string]interface{}{
-		"response_sample": string(body[:sampleSize]),
-		"total_bytes":     len(body),
-	})
-
 	// First, unmarshal into a generic map to inspect the structure
 	var rawResponse map[string]interface{}
 	if err := json.Unmarshal(body, &rawResponse); err != nil {
 		log.Error("Failed to unmarshal response", map[string]interface{}{
-			"error":           err.Error(),
-			"response_sample": string(body[:sampleSize]),
+			"error": err.Error(),
 		})
 		return nil, fmt.Errorf("failed to decode response into raw map: %w", err)
 	}
@@ -285,9 +194,7 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 	// Check if we have a 'results' array
 	resultsRaw, hasResults := rawResponse["results"]
 	if !hasResults {
-		log.Error("No 'results' key in API response", map[string]interface{}{
-			"response": rawResponse,
-		})
+		log.Error("No 'results' key in API response", nil)
 		return nil, fmt.Errorf("no 'results' key in API response")
 	}
 
@@ -321,13 +228,6 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 			"first_book_title":  firstBook.Media.Metadata.Title,
 			"first_book_author": firstBook.Media.Metadata.AuthorName,
 		})
-
-		// Log the raw JSON of the first book
-		if bookJSON, err := json.MarshalIndent(firstBook, "", "  "); err == nil {
-			log.Debug("First book raw JSON", map[string]interface{}{
-				"first_book_json": string(bookJSON),
-			})
-		}
 	}
 
 	result := struct {
@@ -357,7 +257,13 @@ func (c *Client) GetLibraryItems(ctx context.Context, libraryID string) ([]model
 
 // GetUserProgress fetches the current user's progress data from Audiobookshelf
 func (c *Client) GetUserProgress(ctx context.Context) (*models.AudiobookshelfUserProgress, error) {
-	const endpoint = "/me"
+	endpoint := "/me"
+	if c.userID != "" {
+		// Booksync F4: one member's progress through the admin key. The
+		// response also carries that member's legacy token; the progress
+		// model never decodes it and the body is never logged.
+		endpoint = "/users/" + url.PathEscape(c.userID)
+	}
 	log := c.logger.With(map[string]interface{}{
 		"endpoint": endpoint,
 	})
@@ -386,8 +292,7 @@ func (c *Client) GetUserProgress(ctx context.Context) (*models.AudiobookshelfUse
 
 	if resp.StatusCode != http.StatusOK {
 		log.Error("Unexpected status code in GetUserProgress", map[string]interface{}{
-			"status":   resp.StatusCode,
-			"response": string(body),
+			"status": resp.StatusCode,
 		})
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -445,10 +350,10 @@ func (c *Client) GetListeningSessions(ctx context.Context, since time.Time) ([]m
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		// Booksync F4: never log a response body; an Audiobookshelf error
+		// page or user record can carry tokens.
 		log.Error("Unexpected status code", map[string]interface{}{
-			"status":   resp.StatusCode,
-			"response": string(body),
+			"status": resp.StatusCode,
 		})
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}

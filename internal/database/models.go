@@ -36,10 +36,39 @@ type SyncProfile struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	Active      bool      `gorm:"default:true" json:"active"`
 
+	// Booksync F2: the member's Audiobookshelf user. Matched by username on
+	// first connect and held as pending until an admin approves it. NULL until
+	// a match is found; unique when set, so no two profiles can hold the same
+	// Audiobookshelf user. Cleared when the profile is deleted.
+	ABSUserID    *string `gorm:"column:abs_user_id;uniqueIndex" json:"-"`
+	ABSUsername  string  `gorm:"column:abs_username" json:"-"`
+	ABSLinkState string  `gorm:"column:abs_link_state;not null;default:none" json:"-"`
+
+	// Booksync F3: the member's Hardcover OAuth connection. The token set
+	// itself lives encrypted in SyncProfileConfig.HardcoverTokenEncrypted;
+	// these two plain fields are what the dashboard shows.
+	HardcoverState    string `gorm:"column:hardcover_state;not null;default:none" json:"-"`
+	HardcoverUsername string `gorm:"column:hardcover_username" json:"-"`
+
 	// Relationships
 	Config    *SyncProfileConfig `gorm:"foreignKey:ProfileID" json:"config,omitempty"`
 	SyncState *ProfileSyncState  `gorm:"foreignKey:ProfileID" json:"sync_state,omitempty"`
 }
+
+// Audiobookshelf link states for SyncProfile.ABSLinkState (Booksync F2).
+const (
+	ABSLinkStateNone     = "none"
+	ABSLinkStatePending  = "pending"
+	ABSLinkStateApproved = "approved"
+	ABSLinkStateRejected = "rejected"
+)
+
+// Hardcover connection states for SyncProfile.HardcoverState (Booksync F3).
+const (
+	HardcoverStateNone           = "none"
+	HardcoverStateConnected      = "connected"
+	HardcoverStateNeedsReconnect = "needs_reconnect"
+)
 
 // SyncProfileConfig holds the configuration for a specific sync profile
 type SyncProfileConfig struct {

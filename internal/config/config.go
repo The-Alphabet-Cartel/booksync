@@ -13,6 +13,13 @@ import (
 
 // Config holds all configuration for the application
 type Config struct {
+	// TestPerProfileABS restores upstream's per-profile Audiobookshelf URL and
+	// token (Booksync F4). TEST-ONLY: it has no env var and no yaml key, so no
+	// deployment can turn it on. Off means booksync mode, the only real mode:
+	// every profile reads its member's progress through the server-held
+	// Audiobookshelf admin key and an approved link.
+	TestPerProfileABS bool `yaml:"-"`
+
 	// Server configuration
 	Server struct {
 		Port            string        `yaml:"port" env:"PORT"`
@@ -94,6 +101,11 @@ type Config struct {
 		Token string `yaml:"token" env:"HARDCOVER_TOKEN"`
 		// BaseURL is the base URL for the Hardcover GraphQL API
 		BaseURL string `yaml:"base_url" env:"HARDCOVER_BASE_URL"`
+		// Booksync F3: the confidential OAuth client members connect through.
+		// Set from the booksync Secret; never logged.
+		OAuthClientID     string `yaml:"oauth_client_id" env:"HARDCOVER_CLIENT_ID"`
+		OAuthClientSecret string `yaml:"-" env:"HARDCOVER_CLIENT_SECRET"`
+		OAuthRedirectURL  string `yaml:"oauth_redirect_url" env:"HARDCOVER_REDIRECT_URI"`
 	} `yaml:"hardcover"`
 
 	// Application settings
@@ -602,6 +614,16 @@ func loadFromEnv(cfg *Config) {
 	}
 	if baseURL := os.Getenv("HARDCOVER_BASE_URL"); baseURL != "" {
 		cfg.Hardcover.BaseURL = strings.TrimSuffix(baseURL, "/")
+	}
+	// Booksync F3: Hardcover OAuth client
+	if id := os.Getenv("HARDCOVER_CLIENT_ID"); id != "" {
+		cfg.Hardcover.OAuthClientID = id
+	}
+	if secret := os.Getenv("HARDCOVER_CLIENT_SECRET"); secret != "" {
+		cfg.Hardcover.OAuthClientSecret = secret
+	}
+	if redirect := os.Getenv("HARDCOVER_REDIRECT_URI"); redirect != "" {
+		cfg.Hardcover.OAuthRedirectURL = redirect
 	}
 
 	// Server configuration

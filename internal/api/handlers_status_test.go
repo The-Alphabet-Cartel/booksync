@@ -49,6 +49,7 @@ func newStatusServiceFixture(t *testing.T, hardcoverURL string) *statusServiceFi
 	cfg.RateLimit.Rate = time.Nanosecond
 	cfg.RateLimit.MaxConcurrent = 1
 	cfg.Hardcover.BaseURL = hardcoverURL
+	cfg.TestPerProfileABS = true // Booksync F4: upstream per-profile ABS, test-only
 	multiUser := multiuser.NewMultiUserService(repo, cfg, logger.Get())
 	t.Cleanup(func() {
 		require.NoError(t, multiUser.Shutdown(context.Background()))
@@ -386,7 +387,6 @@ func TestCreateProfileValidatesIDs(t *testing.T) {
 				Name:                "Profile ID validation",
 				AudiobookshelfURL:   "http://audiobookshelf.invalid",
 				AudiobookshelfToken: "abs-token",
-				HardcoverToken:      "hardcover-token",
 			})
 			require.NoError(t, err)
 			recorder := httptest.NewRecorder()
@@ -426,7 +426,6 @@ func TestProfileStateFilenameValidationAtHTTPBoundary(t *testing.T) {
 				Name:                "New profile",
 				AudiobookshelfURL:   "http://audiobookshelf.invalid",
 				AudiobookshelfToken: "abs-token",
-				HardcoverToken:      "hardcover-token",
 				SyncConfig:          database.SyncConfigData{StateFile: test.path},
 			})
 			require.NoError(t, err)

@@ -45,6 +45,32 @@ var ErrSyncAlreadyTerminal = errors.New("sync already terminal")
 // ErrProfileDeleting indicates that profile lifecycle teardown is in progress.
 var ErrProfileDeleting = errors.New("sync profile is being deleted")
 
+// ErrProfileNotApproved means an owned profile's Audiobookshelf link has not
+// been approved by an admin, so it must not sync (Booksync F2).
+var ErrProfileNotApproved = errors.New("audiobookshelf link not approved")
+
+// ErrABSSettingsServerManaged rejects a member-supplied Audiobookshelf URL or
+// token in booksync mode (Booksync F4): the server-held admin key must never
+// be sent to a URL a member names.
+var ErrABSSettingsServerManaged = errors.New("audiobookshelf settings are managed by the server")
+
+// PerProfileABS reports whether upstream's per-profile Audiobookshelf settings
+// are in use. Only tests turn it on (config.TestPerProfileABS); every real
+// deployment is in booksync mode.
+func (s *MultiUserService) PerProfileABS() bool {
+	return s.globalConfig != nil && s.globalConfig.TestPerProfileABS
+}
+
+// absAdminConfigured reports whether the server-held Audiobookshelf URL and
+// admin key are both set.
+func (s *MultiUserService) absAdminConfigured() bool {
+	return s.globalConfig != nil && s.globalConfig.Audiobookshelf.URL != "" && s.globalConfig.Audiobookshelf.Token != ""
+}
+
+// ABSAdminConfigured is absAdminConfigured for callers outside the package
+// (the startup check in main).
+func (s *MultiUserService) ABSAdminConfigured() bool { return s.absAdminConfigured() }
+
 // SyncProfileStatus represents the sync status for a profile
 type SyncProfileStatus struct {
 	ProfileID        string             `json:"profile_id"`
@@ -116,6 +142,13 @@ type MultiUserService struct {
 	shutdownMutex         stdSync.Mutex
 	cancellationWaitGroup stdSync.WaitGroup
 	shuttingDown          bool
+
+	// absUsers lists Audiobookshelf users for the F2 link. Nil means "build
+	// one from the server-level Audiobookshelf settings when needed".
+	absUsers ABSUserLister
+
+	// hardcover holds pending OAuth connections (Booksync F3).
+	hardcover hardcoverOAuthState
 }
 
 // NewMultiUserService creates a new multi-user service
@@ -202,6 +235,9 @@ func (s *MultiUserService) CreateProfile(profileID, name, audiobookshelfURL, aud
 
 // CreateProfileForUser creates a profile owned by ownerUserID.
 func (s *MultiUserService) CreateProfileForUser(profileID, name, audiobookshelfURL, audiobookshelfToken, hardcoverToken string, syncConfig database.SyncConfigData, ownerUserID string) error {
+	if !s.PerProfileABS() && (audiobookshelfURL != "" || audiobookshelfToken != "") {
+		return ErrABSSettingsServerManaged
+	}
 	if err := s.validateProfileStateFile(profileID, syncConfig.StateFile); err != nil {
 		return err
 	}
@@ -221,6 +257,9 @@ func (s *MultiUserService) UpdateProfile(profileID, name string) error {
 
 // UpdateProfileConfig updates profile configuration
 func (s *MultiUserService) UpdateProfileConfig(profileID, audiobookshelfURL, audiobookshelfToken, hardcoverToken string, syncConfig database.SyncConfigData) error {
+	if !s.PerProfileABS() && (audiobookshelfURL != "" || audiobookshelfToken != "") {
+		return ErrABSSettingsServerManaged
+	}
 	if syncConfig.StateFile != "" {
 		if err := s.validateProfileStateFile(profileID, syncConfig.StateFile); err != nil {
 			return err
@@ -816,6 +855,32 @@ func (s *MultiUserService) StartSyncWithAcceptedRun(profileID string) (AcceptedS
 	if profileConfig == nil {
 		return AcceptedSyncRun{}, fmt.Errorf("failed to get profile config: %w: %s", ErrProfileNotFound, profileID)
 	}
+	// Booksync F4: without the server-held admin key nothing can sync; checked
+	// first because it is the real blocker for every profile.
+	if !s.PerProfileABS() && !s.absAdminConfigured() {
+		return AcceptedSyncRun{}, fmt.Errorf("%w for profile %s", ErrABSNotConfigured, profileID)
+	}
+	// Booksync F2: an owned profile syncs only after an admin has approved its
+	// Audiobookshelf link. Ownerless profiles (single-user / no-auth paths)
+	// are not gated here; F4 refuses any profile with no linked user.
+	if profileConfig.Profile.OwnerUserID != nil &&
+		database.NormalizeABSLinkState(profileConfig.Profile.ABSLinkState) != database.ABSLinkStateApproved {
+		return AcceptedSyncRun{}, fmt.Errorf("%w for profile %s", ErrProfileNotApproved, profileID)
+	}
+	// Booksync F4: in booksync mode every profile, owned or not, also needs an
+	// approved link to an ABS user. Ownerless profiles can never be linked,
+	// so they never sync.
+	if !s.PerProfileABS() {
+		if database.NormalizeABSLinkState(profileConfig.Profile.ABSLinkState) != database.ABSLinkStateApproved ||
+			profileConfig.Profile.ABSUserID == nil || *profileConfig.Profile.ABSUserID == "" {
+			return AcceptedSyncRun{}, fmt.Errorf("%w for profile %s", ErrProfileNotApproved, profileID)
+		}
+	}
+	// Booksync F3: and only with a working Hardcover connection.
+	if profileConfig.Profile.OwnerUserID != nil &&
+		database.NormalizeHardcoverState(profileConfig.Profile.HardcoverState) != database.HardcoverStateConnected {
+		return AcceptedSyncRun{}, fmt.Errorf("%w for profile %s", ErrHardcoverNotConnected, profileID)
+	}
 	if err := s.validatePersistedProfileStateFile(profileID, profileConfig.SyncConfig.StateFile); err != nil {
 		return AcceptedSyncRun{}, fmt.Errorf("invalid persisted state file for profile %s: %w", profileID, err)
 	}
@@ -1127,7 +1192,19 @@ func (s *MultiUserService) performSync(ctx context.Context, profileID string, pr
 	}
 
 	// Create clients
-	absClient := audiobookshelf.NewClient(profileConfig.AudiobookshelfURL, profileConfig.AudiobookshelfToken)
+	// Booksync F4: in booksync mode the member's progress is read through the
+	// server-held admin key by their linked ABS user id; the start gate has
+	// already proved the key and the link exist.
+	var absClient *audiobookshelf.Client
+	if s.PerProfileABS() {
+		absClient = audiobookshelf.NewClient(profileConfig.AudiobookshelfURL, profileConfig.AudiobookshelfToken)
+	} else {
+		absUserID := ""
+		if profileConfig.Profile.ABSUserID != nil {
+			absUserID = *profileConfig.Profile.ABSUserID
+		}
+		absClient = audiobookshelf.NewClientForUser(s.globalConfig.Audiobookshelf.URL, s.globalConfig.Audiobookshelf.Token, absUserID)
+	}
 
 	// Build Hardcover client config using global settings (rate limits/base URL)
 	hcCfg := hardcover.DefaultClientConfig()
@@ -1150,7 +1227,31 @@ func (s *MultiUserService) performSync(ctx context.Context, profileID string, pr
 		"max_concurrent": hcCfg.MaxConcurrent,
 	})
 
-	hcClient := hardcover.NewClientWithConfig(hcCfg, profileConfig.HardcoverToken, s.logger)
+	// Booksync F3: a connected profile's token comes from an OAuth token
+	// source asked per request; anything else keeps upstream's static token.
+	var hcClient *hardcover.Client
+	if profileConfig.Profile.OwnerUserID != nil &&
+		database.NormalizeHardcoverState(profileConfig.Profile.HardcoverState) == database.HardcoverStateConnected {
+		tokenFunc, err := s.hardcoverTokenFunc(ctx, profileID, profileConfig.HardcoverToken)
+		if err != nil {
+			// Same terminal handling as a sync service that cannot be built,
+			// so the accepted run does not stay queued.
+			status := &SyncProfileStatus{
+				ProfileID:   profileID,
+				ProfileName: profileConfig.Profile.Name,
+			}
+			if run, ok := s.activeRun(profileID, generation); ok {
+				snapshot := newRunSnapshot(profileID, run, string(sync.RunPhaseFailed))
+				snapshot.RunError = fmt.Sprintf("Hardcover connection unusable: %v", err)
+				applySnapshotToStatus(status, snapshot)
+				s.publishFinalStatus(profileID, generation, status)
+			}
+			return
+		}
+		hcClient = hardcover.NewClientWithTokenSource(hcCfg, tokenFunc, s.logger)
+	} else {
+		hcClient = hardcover.NewClientWithConfig(hcCfg, profileConfig.HardcoverToken, s.logger)
+	}
 
 	// Create sync service bound to the accepted run identity. This preserves the
 	// queued run ID/timestamp through service initialization and Sync startup.
@@ -1515,8 +1616,12 @@ func (s *MultiUserService) createProfileSpecificConfig(profileConfig *database.P
 	}
 
 	// Override with profile-specific settings
-	config.Audiobookshelf.URL = profileConfig.AudiobookshelfURL
-	config.Audiobookshelf.Token = profileConfig.AudiobookshelfToken
+	// Booksync F4: booksync mode keeps the server-level Audiobookshelf
+	// settings from the global config copy above.
+	if s.PerProfileABS() {
+		config.Audiobookshelf.URL = profileConfig.AudiobookshelfURL
+		config.Audiobookshelf.Token = profileConfig.AudiobookshelfToken
+	}
 	config.Hardcover.Token = profileConfig.HardcoverToken
 
 	// Apply sync config from profile

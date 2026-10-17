@@ -2313,3 +2313,34 @@ header p {
 .mt-2 { margin-top: 20px; }
 .hidden { display: none; }
 .visible { display: block; }
+
+/* Booksync F2: member -> Audiobookshelf link state and the admin Links view */
+.abs-link-state {
+    font-weight: 600;
+}
+.abs-link-state.active {
+    color: #2e7d32;
+}
+.abs-link-state.pending {
+    color: #b26a00;
+}
+.abs-link-state.inactive {
+    color: #757575;
+}
+.abs-links-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.abs-links-table th,
+.abs-links-table td {
+    text-align: left;
+    padding: 0.5rem;
+    border-bottom: 1px solid #e0e0e0;
+    vertical-align: middle;
+}
+.abs-link-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+}

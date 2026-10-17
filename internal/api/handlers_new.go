@@ -27,6 +27,10 @@ type Handler struct {
 //
 // Sync services are owned by MultiUserService for profile-scoped operations;
 // the HTTP layer does not need a separate single-user service reference.
+// absSettingsServerManagedMessage is returned when a request carries an
+// Audiobookshelf URL or token in booksync mode (Booksync F4).
+const absSettingsServerManagedMessage = "Audiobookshelf settings are managed by the server"
+
 func NewHandler(multiUserService *multiuser.MultiUserService, log *logger.Logger) *Handler {
 	h := &Handler{
 		multiUserService: multiUserService,
@@ -51,12 +55,13 @@ func (h *Handler) SetAuthEnabled(enabled bool) {
 }
 
 // CreateProfileRequest represents the request body for creating a sync profile
+// Booksync F3: there is no hardcover_token field -- members connect
+// Hardcover through OAuth, never by pasting a token.
 type CreateProfileRequest struct {
 	ID                  string                  `json:"id"`
 	Name                string                  `json:"name"`
 	AudiobookshelfURL   string                  `json:"audiobookshelf_url"`
 	AudiobookshelfToken string                  `json:"audiobookshelf_token"`
-	HardcoverToken      string                  `json:"hardcover_token"`
 	SyncConfig          database.SyncConfigData `json:"sync_config"`
 }
 
@@ -66,10 +71,11 @@ type UpdateProfileRequest struct {
 }
 
 // UpdateProfileConfigRequest represents the request body for updating sync profile config
+// Booksync F3: no hardcover_token here either; the stored OAuth token set is
+// always preserved.
 type UpdateProfileConfigRequest struct {
 	AudiobookshelfURL   string                  `json:"audiobookshelf_url"`
 	AudiobookshelfToken string                  `json:"audiobookshelf_token"`
-	HardcoverToken      string                  `json:"hardcover_token"`
 	SyncConfig          database.SyncConfigData `json:"sync_config"`
 }
 
@@ -212,6 +218,8 @@ func (h *Handler) buildProfileResponse(p *database.ProfileWithTokens) map[string
 		},
 		"audiobookshelf_url": p.AudiobookshelfURL,
 		"sync_config":        p.SyncConfig,
+		"abs_link":           absLinkResponse(&prof),
+		"hardcover":          hardcoverResponse(&prof),
 	}
 	return response
 }
@@ -247,6 +255,8 @@ func (h *Handler) GetProfiles(w http.ResponseWriter, r *http.Request) {
 			"active":     p.Active,
 			"created_at": p.CreatedAt,
 			"updated_at": p.UpdatedAt,
+			"abs_link":   absLinkResponse(&p),
+			"hardcover":  hardcoverResponse(&p),
 		}
 		var lastSuccessful interface{} = nil
 		if p.SyncState != nil && p.SyncState.LastSuccessfulAt != nil {
@@ -316,7 +326,13 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" || req.AudiobookshelfURL == "" || req.AudiobookshelfToken == "" || req.HardcoverToken == "" {
+	// Booksync F4: Audiobookshelf settings are server-held; a member never
+	// supplies them. Upstream's per-profile fields survive for tests only.
+	if !h.multiUserService.PerProfileABS() && (req.AudiobookshelfURL != "" || req.AudiobookshelfToken != "") {
+		h.writeErrorResponse(w, http.StatusBadRequest, absSettingsServerManagedMessage)
+		return
+	}
+	if req.Name == "" || (h.multiUserService.PerProfileABS() && (req.AudiobookshelfURL == "" || req.AudiobookshelfToken == "")) {
 		h.writeErrorResponse(w, http.StatusBadRequest, "Missing required fields")
 		return
 	}
@@ -330,7 +346,7 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		req.Name,
 		req.AudiobookshelfURL,
 		req.AudiobookshelfToken,
-		req.HardcoverToken,
+		"", // Booksync F3: Hardcover is connected later through OAuth
 		req.SyncConfig,
 		ownerUserID,
 	)
@@ -345,6 +361,17 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Booksync F2: try to match the owner to their Audiobookshelf user right
+	// away. A failed match never fails the create; the member sees the state
+	// on their profile and can try again.
+	var linkError string
+	if user != nil {
+		if _, linkErr := h.multiUserService.LinkABSUser(r.Context(), req.ID, user.ID, user.Username); linkErr != nil {
+			linkError = absLinkErrorMessage(linkErr)
+			h.logABSLinkFailure(req.ID, linkErr)
+		}
+	}
+
 	// Get the created profile to return in the response
 	profile, err := h.multiUserService.GetProfile(req.ID)
 
@@ -354,7 +381,11 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.writeSuccessResponse(w, h.buildProfileResponse(profile))
+	response := h.buildProfileResponse(profile)
+	if linkError != "" {
+		response["abs_link_error"] = linkError
+	}
+	h.writeSuccessResponse(w, response)
 }
 
 // UpdateProfile handles PUT /api/profiles/{id}
@@ -411,8 +442,14 @@ func (h *Handler) UpdateProfileConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Booksync F4: see CreateProfile.
+	if !h.multiUserService.PerProfileABS() && (req.AudiobookshelfURL != "" || req.AudiobookshelfToken != "") {
+		h.writeErrorResponse(w, http.StatusBadRequest, absSettingsServerManagedMessage)
+		return
+	}
+
 	// At least one field must be provided
-	if req.AudiobookshelfURL == "" && req.AudiobookshelfToken == "" && req.HardcoverToken == "" {
+	if req.AudiobookshelfURL == "" && req.AudiobookshelfToken == "" {
 		// Check if sync config has any actual values set
 		hasSyncConfig := !req.SyncConfig.IsEmpty() ||
 			!req.SyncConfig.ProcessUnreadBooks || // Explicitly set to false
@@ -447,10 +484,8 @@ func (h *Handler) UpdateProfileConfig(w http.ResponseWriter, r *http.Request) {
 		audiobookshelfToken = existingProfile.AudiobookshelfToken
 	}
 
-	hardcoverToken := req.HardcoverToken
-	if hardcoverToken == "" {
-		hardcoverToken = existingProfile.HardcoverToken
-	}
+	// Booksync F3: the Hardcover token set is never replaced from a request.
+	hardcoverToken := existingProfile.HardcoverToken
 
 	// Update profile config
 	if err := h.multiUserService.UpdateProfileConfig(
@@ -628,6 +663,12 @@ func (h *Handler) StartSync(w http.ResponseWriter, r *http.Request) {
 			h.writeErrorResponse(w, http.StatusNotFound, "Sync profile not found")
 		case errors.Is(err, multiuser.ErrSyncAlreadyActive):
 			h.writeErrorResponse(w, http.StatusConflict, "Sync already in progress")
+		case errors.Is(err, multiuser.ErrProfileNotApproved):
+			h.writeErrorResponse(w, http.StatusConflict, "Waiting for an admin to approve the Audiobookshelf link")
+		case errors.Is(err, multiuser.ErrHardcoverNotConnected):
+			h.writeErrorResponse(w, http.StatusConflict, "Connect your Hardcover account first")
+		case errors.Is(err, multiuser.ErrABSNotConfigured):
+			h.writeErrorResponse(w, http.StatusServiceUnavailable, "Audiobookshelf admin key not configured")
 		default:
 			h.log.Error(fmt.Sprintf("Failed to start sync for profile %s: %s", profileID, err.Error()))
 			h.writeErrorResponse(w, http.StatusInternalServerError, "Failed to start sync")
